@@ -1,11 +1,38 @@
 // Viikkoraha PWA Service Worker
-// Cache strategy: Stale-While-Revalidate for app shell, Network First for API
+// Cache strategy: Stale-While-Revalidate, with periodic-update polling
+// Polls index.html every 15 min — if new version detected, notifies all clients
 
-const APP_VERSION = 'viikkoraha-v4';
+const APP_VERSION = 'viikkoraha-v5';
 const STATIC_CACHE = `${APP_VERSION}-static`;
 const API_CACHE = `${APP_VERSION}-api`;
+const POLL_INTERVAL_MIN = 15;
+
+let currentEtag = null;
 
 const STATIC_ASSETS = ['/viikkoraha/', '/viikkoraha/index.html', '/viikkoraha/site.webmanifest'];
+
+// ── Periodic update check ──
+
+async function checkForUpdate() {
+  try {
+    const response = await fetch('/viikkoraha/index.html', { cache: 'no-cache' });
+    if (!response.ok) return;
+    const newEtag = response.headers.get('etag') || response.headers.get('last-modified');
+    if (!newEtag) return;
+
+    if (currentEtag && newEtag !== currentEtag) {
+      const clients = await self.clients.matchAll({ type: 'window' });
+      for (const client of clients) {
+        client.postMessage({ type: 'UPDATE_AVAILABLE' });
+      }
+    }
+    currentEtag = newEtag;
+  } catch {
+    // Offline — ignore
+  }
+}
+
+// ── Lifecycle ──
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -16,23 +43,36 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
+    (async () => {
+      // Start polling
+      await checkForUpdate();
+      setInterval(checkForUpdate, POLL_INTERVAL_MIN * 60 * 1000);
+
+      // Clean old caches
+      const keys = await caches.keys();
+      await Promise.all(
         keys.filter((k) => k !== STATIC_CACHE && k !== API_CACHE).map((k) => caches.delete(k))
-      )
-    )
+      );
+      await self.clients.claim();
+    })()
   );
-  self.clients.claim();
 });
+
+// ── Message handler ──
+
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+});
+
+// ── Fetch strategies ──
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-
-  // Skip non-GET and non-HTTP
   if (event.request.method !== 'GET') return;
   if (!url.protocol.startsWith('http')) return;
 
-  // API calls (Sheets + UserInfo): Network first
   if (
     url.hostname === 'sheets.googleapis.com' ||
     url.hostname === 'www.googleapis.com'
@@ -41,7 +81,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static assets: Stale-while-revalidate
   if (
     url.pathname.match(/\.(js|css|png|svg|ico|json|woff2|webmanifest)$/) ||
     url.pathname === '/viikkoraha/' ||
@@ -51,7 +90,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Google scripts (GIS, GAPI): Network only (don't cache CDN scripts)
   if (
     url.hostname === 'accounts.google.com' ||
     url.hostname === 'apis.google.com'
@@ -59,7 +97,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Fallback: network first
   event.respondWith(networkFirst(event.request, STATIC_CACHE));
 });
 
@@ -82,7 +119,7 @@ async function networkFirst(request, cacheName) {
 
 async function staleWhileRevalidate(request, cacheName) {
   const cached = await caches.match(request);
-  const fetchPromise = fetch(request).then((response) => {
+  const fetchPromise = fetch(request, { cache: 'no-cache' }).then((response) => {
     if (response.ok) {
       caches.open(cacheName).then((cache) => cache.put(request, response.clone()));
     }
